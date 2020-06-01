@@ -4,7 +4,7 @@ go 1.12
 
 replace (
 	github.com/knative/pkg => github.com/rancher/pkg v0.0.0-20190514055449-b30ab9de040e
-	github.com/rancher/types => github.com/ryansann/types v0.0.0-20200529225205-61b506655b13
+	github.com/rancher/types => github.com/ryansann/types v0.0.0-20200601203535-4cb93e642cf6
 	k8s.io/client-go => k8s.io/client-go v0.18.0
 )
 
@@ -27,7 +27,7 @@ require (
 	github.com/mcuadros/go-version v0.0.0-20180611085657-6d5863ca60fa
 	github.com/morikuni/aec v0.0.0-20170113033406-39771216ff4c // indirect
 	github.com/opencontainers/image-spec v1.0.1 // indirect
-	github.com/pkg/errors v0.8.1
+	github.com/pkg/errors v0.9.1
 	github.com/rancher/norman v0.0.0-20200520181341-ab75acb55410
 	github.com/rancher/types v0.0.0-20200326224235-0d1e1dcc8d55
 	github.com/sirupsen/logrus v1.4.2
