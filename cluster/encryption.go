@@ -6,26 +6,27 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	ghodssyaml "github.com/ghodss/yaml"
 	normantypes "github.com/rancher/norman/types"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
-	sigsyaml "sigs.k8s.io/yaml"
-
 	"github.com/rancher/rke/k8s"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/services"
 	"github.com/rancher/rke/templates"
 	v3 "github.com/rancher/rke/types"
 	"github.com/rancher/rke/util"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	apiserverconfig "k8s.io/apiserver/pkg/apis/config"
 	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
 	"k8s.io/client-go/kubernetes"
+	sigsyaml "sigs.k8s.io/yaml"
 )
 
 const (
@@ -113,19 +114,48 @@ func (c *Cluster) DisableSecretsEncryption(ctx context.Context, currentCluster *
 	return nil
 }
 
+const (
+	rewriteSecretsOperation = "rewrite-secrets"
+)
+
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
-	log.Infof(ctx, "Rewriting cluster secrets")
-	var errgrp errgroup.Group
 	k8sClient, err := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if err != nil {
 		return fmt.Errorf("failed to initialize new kubernetes client: %v", err)
 	}
-	secretsList, err := k8s.GetSecretsList(k8sClient, "")
+
+	log.Infof(ctx, "[%s] Retrieving cluster secrets", rewriteSecretsOperation)
+
+	// this is not ideal since all secrets have to fit in memory, do batch list and rewrite together instead
+	// of pulling all secrets and then rewriting
+	secrets, err := c.batchGetSecrets(k8sClient)
 	if err != nil {
 		return err
 	}
 
-	secretsQueue := util.GetObjectQueue(secretsList.Items)
+	numSecrets := len(secrets)
+
+	log.Infof(ctx, "[%s] Rewriting %v secrets", rewriteSecretsOperation, numSecrets)
+
+	// log secret rewrite progress
+	done := make(chan struct{}, SyncWorkers)
+	defer close(done)
+	go func() {
+		rewritten := 0
+		var lastPercent float64
+		for range done {
+			rewritten++
+			curPercent := float64(rewritten) / float64(numSecrets) * 100
+			curPercent = math.Ceil(curPercent)
+			if curPercent > lastPercent && int(curPercent)%5 == 0 {
+				log.Infof(ctx, "[%s] %v%% complete", rewriteSecretsOperation, int(curPercent))
+			}
+			lastPercent = curPercent
+		}
+	}()
+
+	var errgrp errgroup.Group
+	secretsQueue := util.GetObjectQueue(secrets)
 	for w := 0; w < SyncWorkers; w++ {
 		errgrp.Go(func() error {
 			var errList []error
@@ -135,6 +165,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				if err != nil {
 					errList = append(errList, err)
 				}
+				done <- struct{}{}
 			}
 			return util.ErrList(errList)
 		})
@@ -142,33 +173,103 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	if err := errgrp.Wait(); err != nil {
 		return err
 	}
-	log.Infof(ctx, "Cluster secrets rewritten successfully")
+
+	log.Infof(ctx, "[%s] Operation completed", rewriteSecretsOperation)
+
 	return nil
 }
 
+const (
+	secretBatchSize = 100
+)
+
+func (c *Cluster) batchGetSecrets(k8sClient *kubernetes.Clientset) ([]v1.Secret, error) {
+	var secrets []v1.Secret
+	var continueToken string
+	for {
+		secretsList, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
+			Limit:    secretBatchSize,
+			Continue: continueToken,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		secrets = append(secrets, secretsList.Items...)
+
+		if secretsList.Continue == "" {
+			break
+		}
+
+		continueToken = secretsList.Continue
+	}
+
+	return secrets, nil
+}
+
+// RotateEncryptionKey procedure:
+// - Generate a new key and add it as the second key entry for the current provider on all servers
+// - Restart all kube-apiserver processes to ensure each server can decrypt using the new key
+// - Make the new key the first entry in the keys array so that it is used for encryption in the config
+// - Restart all kube-apiserver processes to ensure each server now encrypts using the new key
+// - update all existing secrets to ensure they are encrypted with the new key
+// - Remove the old decryption key from the config
+// See: https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/#rotating-a-decryption-key for more info
 func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState) error {
-	//generate new key
+	// generate new key
 	newKey, err := generateEncryptionKey()
 	if err != nil {
 		return err
 	}
+
 	oldKey, err := c.extractActiveKey(c.EncryptionConfig.EncryptionProviderFile)
 	if err != nil {
 		return err
 	}
-	// reverse the keys order in the file, making newKey the Active Key
-	initialKeyList := []*encryptionKey{ // order is critical here!
-		newKey,
-		oldKey,
-	}
-	initialProviderConfig, err := providerFileFromKeyList(keyList{KeyList: initialKeyList})
+
+	// Ensure decryption can be done with newKey
+	logrus.Debug("appending new encryption key to provider config [oldKey, newKey]")
+
+	err = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey, newKey}, fullState)
 	if err != nil {
 		return err
 	}
-	c.EncryptionConfig.EncryptionProviderFile = initialProviderConfig
+
+	// Ensure encryption is done with newKey
+	logrus.Debug("reordering encryption keys in provider config [newKey, oldKey]")
+
+	err = c.updateEncryptionProvider(ctx, []*encryptionKey{newKey, oldKey}, fullState)
+	if err != nil {
+		return err
+	}
+
+	// rewrite secrets via updates to secrets
+	if err := c.RewriteSecrets(ctx); err != nil {
+		return err
+	}
+
+	// At this point, all secrets have been rewritten using the newKey, so we remove the old one.
+	logrus.Debug("removing old encryption key in provider config [newKey]")
+
+	err = c.updateEncryptionProvider(ctx, []*encryptionKey{newKey}, fullState)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Cluster) updateEncryptionProvider(ctx context.Context, keys []*encryptionKey, fullState *FullState) error {
+	providerConfig, err := providerFileFromKeyList(keyList{KeyList: keys})
+	if err != nil {
+		return err
+	}
+
+	c.EncryptionConfig.EncryptionProviderFile = providerConfig
 	if err := c.DeployEncryptionProviderFile(ctx); err != nil {
 		return err
 	}
+
 	// commit to state as soon as possible
 	logrus.Debugf("[%s] Updating cluster state", services.ControlRole)
 	if err := c.UpdateClusterCurrentState(ctx, fullState); err != nil {
@@ -177,30 +278,7 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 	if err := services.RestartKubeAPIWithHealthcheck(ctx, c.ControlPlaneHosts, c.LocalConnDialerFactory, c.Certificates); err != nil {
 		return err
 	}
-	// rewrite secrets
-	if err := c.RewriteSecrets(ctx); err != nil {
-		return err
-	}
-	// At this point, all secrets have been rewritten using the newKey, so we remove the old one.
-	finalKeyList := []*encryptionKey{
-		newKey,
-	}
-	finalProviderConfig, err := providerFileFromKeyList(keyList{KeyList: finalKeyList})
-	if err != nil {
-		return err
-	}
-	c.EncryptionConfig.EncryptionProviderFile = finalProviderConfig
-	if err := c.DeployEncryptionProviderFile(ctx); err != nil {
-		return err
-	}
-	// commit to state
-	logrus.Debugf("[%s] Updating cluster state", services.ControlRole)
-	if err := c.UpdateClusterCurrentState(ctx, fullState); err != nil {
-		return err
-	}
-	if err := services.RestartKubeAPIWithHealthcheck(ctx, c.ControlPlaneHosts, c.LocalConnDialerFactory, c.Certificates); err != nil {
-		return err
-	}
+
 	return nil
 }
 
@@ -335,6 +413,7 @@ func isEncryptionEnabled(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
 	}
 	return false
 }
+
 func isEncryptionCustomConfig(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
 	if isEncryptionEnabled(rkeConfig) &&
 		rkeConfig.Services.KubeAPI.SecretsEncryptionConfig.CustomConfig != nil {
