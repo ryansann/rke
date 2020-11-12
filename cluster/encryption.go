@@ -123,7 +123,7 @@ const (
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	k8sClient, cliErr := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if cliErr != nil {
-		return fmt.Errorf("failed to initialize new kubernetes client: %v", err)
+		return fmt.Errorf("failed to initialize new kubernetes client: %v", cliErr)
 	}
 
 	retriable := func(err error) bool { // all errors are retriable
