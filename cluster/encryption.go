@@ -26,6 +26,7 @@ import (
 	apiserverconfig "k8s.io/apiserver/pkg/apis/config"
 	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
@@ -116,9 +117,103 @@ func (c *Cluster) DisableSecretsEncryption(ctx context.Context, currentCluster *
 
 const (
 	rewriteSecretsOperation = "rewrite-secrets"
+	rewriteBatchSize        = 1000
 )
 
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
+	k8sClient, cliErr := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
+	if cliErr != nil {
+		return fmt.Errorf("failed to initialize new kubernetes client: %v", err)
+	}
+
+	retriable := func(err error) bool { // all errors are retriable
+		return true
+	}
+
+	rewrites := make(chan interface{}, SyncWorkers)
+	go func() {
+		defer close(rewrites) // exit workers
+
+		var continueToken string
+		var secrets []v1.Secret
+		for {
+			err := retry.OnError(retry.DefaultRetry, retriable, func() error {
+				l, err := c.getSecretsBatch(k8sClient, continueToken)
+				if err != nil {
+					return err
+				}
+
+				secrets = append(secrets, l.Items...)
+				continueToken = l.Continue
+
+				return nil
+			})
+			if err != nil {
+				cliErr = err // set outer client error
+				break
+			}
+
+			if len(secrets) >= rewriteBatchSize {
+				for _, s := range secrets {
+					rewrites <- s
+				}
+				secrets = nil // reset secrets since they've been sent to workers
+			}
+
+			// if there's no continue token, we've retrieved all secrets4
+			if continueToken == "" {
+				for _, s := range secrets { // drain remaining secrets as this is the last (potentially not full) rewrite batch
+					rewrites <- s
+				}
+				break
+			}
+		}
+	}()
+
+	// log secret rewrite progress
+	// NOTE: we don't know total number of secrets up front, so telling the user how many we've rewritten is the best we can do
+	done := make(chan struct{}, SyncWorkers)
+	defer close(done)
+	go func() {
+		var rewritten int
+		for range done {
+			rewritten++
+			if rewritten%50 == 0 { // log a message every 50 secrets
+				log.Infof(ctx, "[%s] %v secrets rewritten", rewriteSecretsOperation, rewritten)
+			}
+		}
+	}()
+
+	// spawn workers to perform secret rewrites
+	var errgrp errgroup.Group
+	for w := 0; w < SyncWorkers; w++ {
+		errgrp.Go(func() error {
+			var errList []error
+			for secret := range rewrites {
+				s := secret.(v1.Secret)
+				err := rewriteSecret(k8sClient, &s)
+				if err != nil {
+					errList = append(errList, err)
+				}
+				done <- struct{}{}
+			}
+			return util.ErrList(errList)
+		})
+	}
+	if err := errgrp.Wait(); err != nil {
+		return err
+	}
+
+	if cliErr != nil {
+		log.Infof(ctx, "[%s] Operation encountered error: %v", rewriteSecretsOperation, cliErr)
+	} else {
+		log.Infof(ctx, "[%s] Operation completed", rewriteSecretsOperation)
+	}
+
+	return cliErr
+}
+
+func (c *Cluster) RewriteSecrets2(ctx context.Context) error {
 	k8sClient, err := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if err != nil {
 		return fmt.Errorf("failed to initialize new kubernetes client: %v", err)
@@ -154,8 +249,8 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		}
 	}()
 
-	var errgrp errgroup.Group
 	secretsQueue := util.GetObjectQueue(secrets)
+	var errgrp errgroup.Group
 	for w := 0; w < SyncWorkers; w++ {
 		errgrp.Go(func() error {
 			var errList []error
@@ -207,12 +302,24 @@ func (c *Cluster) batchGetSecrets(k8sClient *kubernetes.Clientset) ([]v1.Secret,
 	return secrets, nil
 }
 
+// getSecretsBatch gets a single batch of N secrets where N is secretsBatchSize
+func (c *Cluster) getSecretsBatch(k8sClient *kubernetes.Clientset, continueToken string) (*v1.SecretList, error) {
+	secretsList, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
+		Limit:    secretBatchSize, // keep the per request secrets batch size small to avoid client timeouts
+		Continue: continueToken,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return secretsList, nil
+}
+
 // RotateEncryptionKey procedure:
 // - Generate a new key and add it as the second key entry for the current provider on all servers
 // - Restart all kube-apiserver processes to ensure each server can decrypt using the new key
 // - Make the new key the first entry in the keys array so that it is used for encryption in the config
 // - Restart all kube-apiserver processes to ensure each server now encrypts using the new key
-// - update all existing secrets to ensure they are encrypted with the new key
+// - Update all existing secrets to ensure they are encrypted with the new key
 // - Remove the old decryption key from the config
 // See: https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/#rotating-a-decryption-key for more info
 func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState) error {
@@ -228,16 +335,16 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 	}
 
 	// Ensure decryption can be done with newKey
-	logrus.Debug("appending new encryption key to provider config [oldKey, newKey]")
+	logrus.Debug("appending new encryption key, provider config: [oldKey, newKey]")
 
 	err = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey, newKey}, fullState)
 	if err != nil {
 		return err
 	}
 
-	// Ensure encryption is done with newKey
-	logrus.Debug("reordering encryption keys in provider config [newKey, oldKey]")
+	logrus.Debug("reordering encryption keys, provider config: [newKey, oldKey]")
 
+	// Ensure encryption is done with newKey
 	err = c.updateEncryptionProvider(ctx, []*encryptionKey{newKey, oldKey}, fullState)
 	if err != nil {
 		return err
@@ -249,7 +356,7 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 	}
 
 	// At this point, all secrets have been rewritten using the newKey, so we remove the old one.
-	logrus.Debug("removing old encryption key in provider config [newKey]")
+	logrus.Debug("removing old encryption key, provider config: [newKey]")
 
 	err = c.updateEncryptionProvider(ctx, []*encryptionKey{newKey}, fullState)
 	if err != nil {
