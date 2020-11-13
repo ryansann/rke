@@ -130,7 +130,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		return true
 	}
 
-	rewrites := make(chan interface{}, SyncWorkers)
+	rewrites := make(chan interface{}, rewriteBatchSize)
 	go func() {
 		defer close(rewrites) // exit workers
 
@@ -391,6 +391,7 @@ func (c *Cluster) updateEncryptionProvider(ctx context.Context, keys []*encrypti
 
 func (c *Cluster) DeployEncryptionProviderFile(ctx context.Context) error {
 	logrus.Debugf("[%s] Deploying Encryption Provider Configuration file on Control Plane nodes..", services.ControlRole)
+	logrus.Tracef("Deploying encryption provider file: %s", c.EncryptionConfig.EncryptionProviderFile)
 	return deployFile(ctx, c.ControlPlaneHosts, c.SystemImages.Alpine, c.PrivateRegistriesMap, EncryptionProviderFilePath, c.EncryptionConfig.EncryptionProviderFile)
 }
 
