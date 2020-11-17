@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 
 	ghodssyaml "github.com/ghodss/yaml"
 	normantypes "github.com/rancher/norman/types"
@@ -139,7 +140,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		for {
 			err := retry.OnError(retry.DefaultRetry, retriable, func() error {
 				l, err := c.getSecretsBatch(k8sClient, continueToken)
-				if err != nil {
+				if err != nil && !isExpiredTokenErr(err) {
 					return err
 				}
 
@@ -165,7 +166,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 			}
 		}
 
-		logrus.Debugf("[%v] All secrets retrieved and sent for rewrites", rewriteSecretsOperation)
+		logrus.Debugf("[%v] All secrets retrieved and sent for rewrite", rewriteSecretsOperation)
 	}()
 
 	// NOTE: since we retrieve secrets in batches, we don't know total number of secrets up front.
@@ -480,6 +481,18 @@ func (c *Cluster) generateDisabledEncryptionProviderFile() (string, error) {
 		return "", err
 	}
 	return disabledProviderFileFromKey(key)
+}
+
+const (
+	errExpiredToken = "The provided continue parameter is too old"
+)
+
+// isExpiredTokenErr returns true if the error passed in is due to a continue token expiring
+func isExpiredTokenErr(err error) bool {
+	if strings.Contains(err.Error(), errExpiredToken) {
+		return true
+	}
+	return false
 }
 
 func rewriteSecret(k8sClient *kubernetes.Clientset, secret *v1.Secret) error {
