@@ -139,7 +139,10 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		var secrets []v1.Secret
 		for {
 			err := retry.OnError(retry.DefaultRetry, retriable, func() error {
-				l, err := c.getSecretsBatch(k8sClient, continueToken)
+				l, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
+					Limit:    secretBatchSize, // keep the per request secrets batch size small to avoid client timeouts
+					Continue: continueToken,
+				})
 				if err != nil && !isExpiredTokenErr(err) {
 					return err
 				}
@@ -296,18 +299,6 @@ func (c *Cluster) batchGetSecrets(k8sClient *kubernetes.Clientset) ([]v1.Secret,
 	}
 
 	return secrets, nil
-}
-
-// getSecretsBatch gets a single batch of N secrets where N is secretsBatchSize
-func (c *Cluster) getSecretsBatch(k8sClient *kubernetes.Clientset, continueToken string) (*v1.SecretList, error) {
-	secretsList, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
-		Limit:    secretBatchSize, // keep the per request secrets batch size small to avoid client timeouts
-		Continue: continueToken,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return secretsList, nil
 }
 
 // RotateEncryptionKey procedure:
