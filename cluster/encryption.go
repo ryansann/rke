@@ -117,7 +117,7 @@ func (c *Cluster) DisableSecretsEncryption(ctx context.Context, currentCluster *
 
 const (
 	rewriteSecretsOperation = "rewrite-secrets"
-	rewriteBatchSize        = 1000
+	secretBatchSize         = 100
 )
 
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
@@ -130,7 +130,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		return true
 	}
 
-	rewrites := make(chan interface{}, rewriteBatchSize)
+	rewrites := make(chan interface{}, secretBatchSize)
 	go func() {
 		defer close(rewrites) // exit workers
 
@@ -153,25 +153,23 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				break
 			}
 
-			if len(secrets) >= rewriteBatchSize {
-				for _, s := range secrets {
-					rewrites <- s
-				}
-				secrets = nil // reset secrets since they've been sent to workers
+			// send this batch to workers for rewrite
+			for _, s := range secrets {
+				rewrites <- s
 			}
+			secrets = nil // reset secrets since they've been sent to workers
 
-			// if there's no continue token, we've retrieved all secrets4
+			// if there's no continue token, we've retrieved all secrets
 			if continueToken == "" {
-				for _, s := range secrets { // drain remaining secrets as this is the last (potentially not full) rewrite batch
-					rewrites <- s
-				}
 				break
 			}
 		}
+
+		logrus.Debugf("[%v] All secrets retrieved and sent for rewrites", rewriteSecretsOperation)
 	}()
 
-	// log secret rewrite progress
-	// NOTE: we don't know total number of secrets up front, so telling the user how many we've rewritten is the best we can do
+	// NOTE: since we retrieve secrets in batches, we don't know total number of secrets up front.
+	// Telling the user how many we've rewritten is the best we can do
 	done := make(chan struct{}, SyncWorkers)
 	defer close(done)
 	go func() {
@@ -201,6 +199,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		})
 	}
 	if err := errgrp.Wait(); err != nil {
+		logrus.Errorf("[%v] error: %v", rewriteSecretsOperation, err)
 		return err
 	}
 
@@ -273,10 +272,6 @@ func (c *Cluster) RewriteSecrets2(ctx context.Context) error {
 
 	return nil
 }
-
-const (
-	secretBatchSize = 100
-)
 
 func (c *Cluster) batchGetSecrets(k8sClient *kubernetes.Clientset) ([]v1.Secret, error) {
 	var secrets []v1.Secret
