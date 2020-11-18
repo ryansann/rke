@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
 	"strings"
 
 	ghodssyaml "github.com/ghodss/yaml"
@@ -121,24 +120,31 @@ const (
 	secretBatchSize         = 100
 )
 
+// RewriteSecrets does the following:
+// - retrieves all cluster secrets in batches with size of <secretBatchSize>
+// - triggers rewrites with new encryption key for each secrets over a channel to workers which perform the rewrite
+// - logs progress of rewrite operation
+// NOTE: For large sets of secrets, the continue token used to retrieve secrets in batches will likely expire.
+// The expiration time is equivalent to the etcd compaction interval, which defaults to 5 minutes.
+// This is fine for our purposes as we are only concerned with rewriting secrets that exist when this operation begins.
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	k8sClient, cliErr := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if cliErr != nil {
 		return fmt.Errorf("failed to initialize new kubernetes client: %v", cliErr)
 	}
 
-	retriable := func(err error) bool { // all errors are retriable
-		return true
-	}
-
 	rewrites := make(chan interface{}, secretBatchSize)
 	go func() {
-		defer close(rewrites) // exit workers
+		defer close(rewrites) // exiting this go routine triggers workers to exit
+
+		retryErr := func(err error) bool { // all errors are retriable
+			return true
+		}
 
 		var continueToken string
 		var secrets []v1.Secret
 		for {
-			err := retry.OnError(retry.DefaultRetry, retriable, func() error {
+			err := retry.OnError(retry.DefaultRetry, retryErr, func() error {
 				l, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
 					Limit:    secretBatchSize, // keep the per request secrets batch size small to avoid client timeouts
 					Continue: continueToken,
@@ -153,7 +159,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				return nil
 			})
 			if err != nil {
-				cliErr = err // set outer client error
+				cliErr = err // outer client error
 				break
 			}
 
@@ -204,7 +210,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	}
 	if err := errgrp.Wait(); err != nil {
 		logrus.Errorf("[%v] error: %v", rewriteSecretsOperation, err)
-		return err
+		return err // worker error from rewrites
 	}
 
 	if cliErr != nil {
@@ -213,92 +219,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		log.Infof(ctx, "[%s] Operation completed", rewriteSecretsOperation)
 	}
 
-	return cliErr
-}
-
-func (c *Cluster) RewriteSecrets2(ctx context.Context) error {
-	k8sClient, err := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
-	if err != nil {
-		return fmt.Errorf("failed to initialize new kubernetes client: %v", err)
-	}
-
-	log.Infof(ctx, "[%s] Retrieving cluster secrets", rewriteSecretsOperation)
-
-	// this is not ideal since all secrets have to fit in memory, do batch list and rewrite together instead
-	// of pulling all secrets and then rewriting
-	secrets, err := c.batchGetSecrets(k8sClient)
-	if err != nil {
-		return err
-	}
-
-	numSecrets := len(secrets)
-
-	log.Infof(ctx, "[%s] Rewriting %v secrets", rewriteSecretsOperation, numSecrets)
-
-	// log secret rewrite progress
-	done := make(chan struct{}, SyncWorkers)
-	defer close(done)
-	go func() {
-		rewritten := 0
-		var lastPercent float64
-		for range done {
-			rewritten++
-			curPercent := float64(rewritten) / float64(numSecrets) * 100
-			curPercent = math.Ceil(curPercent)
-			if curPercent > lastPercent && int(curPercent)%5 == 0 {
-				log.Infof(ctx, "[%s] %v%% complete", rewriteSecretsOperation, int(curPercent))
-			}
-			lastPercent = curPercent
-		}
-	}()
-
-	secretsQueue := util.GetObjectQueue(secrets)
-	var errgrp errgroup.Group
-	for w := 0; w < SyncWorkers; w++ {
-		errgrp.Go(func() error {
-			var errList []error
-			for secret := range secretsQueue {
-				s := secret.(v1.Secret)
-				err := rewriteSecret(k8sClient, &s)
-				if err != nil {
-					errList = append(errList, err)
-				}
-				done <- struct{}{}
-			}
-			return util.ErrList(errList)
-		})
-	}
-	if err := errgrp.Wait(); err != nil {
-		return err
-	}
-
-	log.Infof(ctx, "[%s] Operation completed", rewriteSecretsOperation)
-
-	return nil
-}
-
-func (c *Cluster) batchGetSecrets(k8sClient *kubernetes.Clientset) ([]v1.Secret, error) {
-	var secrets []v1.Secret
-	var continueToken string
-	for {
-		secretsList, err := k8sClient.CoreV1().Secrets("").List(context.TODO(), metav1.ListOptions{
-			Limit:    secretBatchSize,
-			Continue: continueToken,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		secrets = append(secrets, secretsList.Items...)
-
-		if secretsList.Continue == "" {
-			break
-		}
-
-		continueToken = secretsList.Continue
-	}
-
-	return secrets, nil
+	return cliErr // client error from retrieving secrets
 }
 
 // RotateEncryptionKey procedure:
