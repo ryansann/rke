@@ -137,7 +137,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	go func() {
 		defer close(rewrites) // exiting this go routine triggers workers to exit
 
-		retryErr := func(err error) bool { // all errors are retriable
+		retryErr := func(err error) bool { // all returned errors can be retried
 			return true
 		}
 
@@ -242,15 +242,7 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 		return err
 	}
 
-	// Ensure decryption can be done with newKey
-	logrus.Debug("appending new encryption key, provider config: [oldKey, newKey]")
-
-	err = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey, newKey}, fullState)
-	if err != nil {
-		return err
-	}
-
-	logrus.Debug("reordering encryption keys, provider config: [newKey, oldKey]")
+	logrus.Debug("adding new encryption key, provider config: [newKey, oldKey]")
 
 	// Ensure encryption is done with newKey
 	err = c.updateEncryptionProvider(ctx, []*encryptionKey{newKey, oldKey}, fullState)
