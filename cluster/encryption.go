@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 
 	ghodssyaml "github.com/ghodss/yaml"
 	normantypes "github.com/rancher/norman/types"
@@ -127,15 +128,16 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize new kubernetes client: %v", cliErr)
 	}
 
-	retriable := func(err error) bool { // all errors are retriable
-		return true
-	}
-
 	rewrites := make(chan interface{}, secretBatchSize)
 	go func() {
 		defer close(rewrites) // exit workers
 
+		retriable := func(err error) bool { // all errors are retriable
+			return true
+		}
+
 		var continueToken string
+		var restart bool
 		var secrets []v1.Secret
 		for {
 			err := retry.OnError(retry.DefaultRetry, retriable, func() error {
@@ -143,7 +145,13 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 					Limit:    secretBatchSize, // keep the per request secrets batch size small to avoid client timeouts
 					Continue: continueToken,
 				})
-				if err != nil && !isExpiredTokenErr(err) {
+				if err != nil {
+					if isExpiredTokenErr(err) { // continueToken is expired, restart list operation
+						logrus.Debugf("[%v] continue token expired, restarting list operation")
+						restart = true
+						continueToken = ""
+						return nil
+					}
 					return err
 				}
 
@@ -153,7 +161,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				return nil
 			})
 			if err != nil {
-				cliErr = err // set outer client error
+				cliErr = err // outer client error
 				break
 			}
 
@@ -163,8 +171,8 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 			}
 			secrets = nil // reset secrets since they've been sent to workers
 
-			// if there's no continue token, we've retrieved all secrets
-			if continueToken == "" {
+			// if there's no continue token and restart list operation wasn't triggered, we've retrieved all secrets
+			if continueToken == "" && !restart {
 				break
 			}
 		}
@@ -186,6 +194,12 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 		}
 	}()
 
+	var mtx sync.RWMutex
+	rewritten := make(map[string]struct{}, secretBatchSize)
+	getSecretID := func(s v1.Secret) string {
+		return strings.Join([]string{s.Namespace, s.Name}, "/")
+	}
+
 	// spawn workers to perform secret rewrites
 	var errgrp errgroup.Group
 	for w := 0; w < SyncWorkers; w++ {
@@ -193,12 +207,27 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 			var errList []error
 			for secret := range rewrites {
 				s := secret.(v1.Secret)
+				id := getSecretID(s)
+
+				mtx.RLock()
+				_, ok := rewritten[id]
+				mtx.RUnlock()
+				if ok {
+					continue // we've already rewritten this secret
+				}
+
 				err := rewriteSecret(k8sClient, &s)
 				if err != nil {
 					errList = append(errList, err)
 				}
+
+				mtx.Lock()
+				rewritten[id] = struct{}{}
+				mtx.Unlock()
+
 				done <- struct{}{}
 			}
+
 			return util.ErrList(errList)
 		})
 	}
