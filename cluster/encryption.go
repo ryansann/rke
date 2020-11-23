@@ -222,14 +222,6 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	return cliErr // client error from retrieving secrets
 }
 
-// RotateEncryptionKey procedure:
-// - Generate a new key and add it as the second key entry for the current provider on all servers
-// - Restart all kube-apiserver processes to ensure each server can decrypt using the new key
-// - Make the new key the first entry in the keys array so that it is used for encryption in the config
-// - Restart all kube-apiserver processes to ensure each server now encrypts using the new key
-// - Update all existing secrets to ensure they are encrypted with the new key
-// - Remove the old decryption key from the config
-// See: https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/#rotating-a-decryption-key for more info
 func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState) error {
 	// generate new key
 	newKey, err := generateEncryptionKey()
@@ -252,6 +244,8 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 
 	// rewrite secrets via updates to secrets
 	if err := c.RewriteSecrets(ctx); err != nil {
+		// in the case of an error during rewrite, the cluster will need to be restored, so redeploy the initial encryption provider config
+		_ = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey}, fullState)
 		return err
 	}
 
