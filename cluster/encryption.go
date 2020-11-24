@@ -244,7 +244,6 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 
 	// rewrite secrets via updates to secrets
 	if err := c.RewriteSecrets(ctx); err != nil {
-		log.Infof(ctx, "encryption key rotation failed: %v, please restore your cluster from backup", err)
 		// in the case of an error during rewrite, the cluster will need to be restored, so redeploy the initial encryption provider config
 		_ = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey}, fullState)
 		return err
