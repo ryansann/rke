@@ -165,6 +165,9 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 
 			// send this batch to workers for rewrite
 			for _, s := range secrets {
+				if strings.HasPrefix(s.Name, "default-token") {
+					logrus.Debugf("default-token secret: %+v", s)
+				}
 				rewrites <- s
 			}
 			secrets = nil // reset secrets since they've been sent to workers
@@ -401,9 +404,9 @@ func rewriteSecret(k8sClient *kubernetes.Clientset, secret *v1.Secret) error {
 	if apierrors.IsConflict(err) {
 		secret, err = k8s.GetSecret(k8sClient, secret.Name, secret.Namespace)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
+			//if apierrors.IsNotFound(err) {
+			//	return nil
+			//}
 			return err
 		}
 		err = k8s.UpdateSecret(k8sClient, secret)
