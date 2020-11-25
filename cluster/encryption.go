@@ -122,7 +122,7 @@ const (
 
 // RewriteSecrets does the following:
 // - retrieves all cluster secrets in batches with size of <secretBatchSize>
-// - triggers rewrites with new encryption key for each secrets over a channel to workers which perform the rewrite
+// - triggers rewrites with new encryption key by sending each secret over a channel consumed by workers that perform the rewrite
 // - logs progress of rewrite operation
 // NOTE: For large sets of secrets, the continue token used to retrieve secrets in batches will likely expire.
 // The expiration time is equivalent to the etcd compaction interval, which defaults to 5 minutes.
@@ -165,9 +165,6 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 
 			// send this batch to workers for rewrite
 			for _, s := range secrets {
-				if strings.HasPrefix(s.Name, "default-token") {
-					logrus.Debugf("default-token secret: %+v", s)
-				}
 				rewrites <- s
 			}
 			secrets = nil // reset secrets since they've been sent to workers
@@ -404,9 +401,10 @@ func rewriteSecret(k8sClient *kubernetes.Clientset, secret *v1.Secret) error {
 	if apierrors.IsConflict(err) {
 		secret, err = k8s.GetSecret(k8sClient, secret.Name, secret.Namespace)
 		if err != nil {
-			//if apierrors.IsNotFound(err) {
-			//	return nil
-			//}
+			// if the secret no longer exists, we can skip it since it does not need to be rewritten
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
 			return err
 		}
 		err = k8s.UpdateSecret(k8sClient, secret)
