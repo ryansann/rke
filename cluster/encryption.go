@@ -125,9 +125,6 @@ const (
 // - retrieves all cluster secrets in batches with size of <secretBatchSize>
 // - triggers rewrites with new encryption key by sending each secret over a channel consumed by workers that perform the rewrite
 // - logs progress of rewrite operation
-// NOTE: For large sets of secrets, the continue token used to retrieve secrets in batches will likely expire.
-// The expiration time is equivalent to the etcd compaction interval, which defaults to 5 minutes.
-// This is fine for our purposes as we are only concerned with rewriting secrets that exist when this operation begins.
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 	k8sClient, cliErr := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if cliErr != nil {
