@@ -58,7 +58,7 @@ type RancherKubernetesEngineConfig struct {
 	// Rotating Certificates Option
 	RotateCertificates *RotateCertificates `yaml:"rotate_certificates,omitempty" json:"rotateCertificates,omitempty"`
 	// Rotate Encryption Key Option
-	RotateEncryptionKey bool `yaml:"rotate_encryption_key,omitempty" json:"rotateEncryptionKey,omitempty"`
+	RotateEncryptionKey bool `yaml:"rotate_encryption_key" json:"rotateEncryptionKey"`
 	// DNS Config
 	DNS *DNSConfig `yaml:"dns" json:"dns,omitempty"`
 	// Upgrade Strategy for the cluster

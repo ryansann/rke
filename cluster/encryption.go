@@ -126,6 +126,8 @@ const (
 // - triggers rewrites with new encryption key by sending each secret over a channel consumed by workers that perform the rewrite
 // - logs progress of rewrite operation
 func (c *Cluster) RewriteSecrets(ctx context.Context) error {
+	log.Infof(ctx, "Rewriting cluster secrets")
+
 	k8sClient, cliErr := k8s.NewClient(c.LocalKubeConfigPath, c.K8sWrapTransport)
 	if cliErr != nil {
 		return fmt.Errorf("failed to initialize new kubernetes client: %v", cliErr)
@@ -151,7 +153,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				if err != nil {
 					if isExpiredTokenErr(err) {
 						logrus.Debugf("[%v] continue token expired, restarting list operation", rewriteSecretsOperation)
-						continueToken = "" // restart list operation due to token timeout
+						continueToken = "" // restart list operation due to token expiration
 						restart = true
 						return nil
 					}
@@ -314,7 +316,6 @@ func (c *Cluster) updateEncryptionProvider(ctx context.Context, keys []*encrypti
 
 func (c *Cluster) DeployEncryptionProviderFile(ctx context.Context) error {
 	logrus.Debugf("[%s] Deploying Encryption Provider Configuration file on Control Plane nodes..", services.ControlRole)
-	logrus.Tracef("Deploying encryption provider file: %s", c.EncryptionConfig.EncryptionProviderFile)
 	return deployFile(ctx, c.ControlPlaneHosts, c.SystemImages.Alpine, c.PrivateRegistriesMap, EncryptionProviderFilePath, c.EncryptionConfig.EncryptionProviderFile)
 }
 
