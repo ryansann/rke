@@ -153,6 +153,7 @@ func (c *Cluster) RewriteSecrets(ctx context.Context) error {
 				})
 				if err != nil {
 					if isExpiredTokenErr(err) {
+						logrus.Debugf("[%v] continue token expired, restarting list operation", rewriteSecretsOperation)
 						continueToken = "" // restart list operation due to token timeout
 						restart = true
 						return nil
