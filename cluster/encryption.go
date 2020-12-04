@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pkg/errors"
+
 	ghodssyaml "github.com/ghodss/yaml"
 	normantypes "github.com/rancher/norman/types"
 	"github.com/rancher/rke/k8s"
@@ -276,8 +278,19 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 
 	// rewrite secrets via updates to secrets
 	if err := c.RewriteSecrets(ctx); err != nil {
-		// in the case of an error during rewrite, the cluster will need to be restored, so redeploy the initial encryption provider config
-		_ = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey}, fullState)
+		// if there's a rewrite error, the cluster will need to be restored, so redeploy the initial encryption provider config
+		var updateErr error
+		for i := 0; i < 3; i++ { // up to 3 retries
+			updateErr = c.updateEncryptionProvider(ctx, []*encryptionKey{oldKey}, fullState)
+			if updateErr == nil {
+				break
+			}
+		}
+
+		if updateErr != nil {
+			err = errors.Wrap(err, updateErr.Error())
+		}
+
 		return err
 	}
 
