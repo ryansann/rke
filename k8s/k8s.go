@@ -15,7 +15,7 @@ const (
 	DefaultRetries          = 5
 	DefaultSleepSeconds     = 5
 	DefaultTimeout          = 30
-	K8sWrapTransportTimeout = 30
+	K8sWrapTransportTimeout = 1
 )
 
 type k8sCall func(*kubernetes.Clientset, interface{}) error
