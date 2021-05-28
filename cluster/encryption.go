@@ -33,7 +33,8 @@ import (
 )
 
 const (
-	EncryptionProviderFilePath = "/etc/kubernetes/ssl/encryption.yaml"
+	EncryptionProviderFilePath       = "/etc/kubernetes/ssl/encryption.yaml"
+	EncryptionProviderBackupFilePath = "/etc/kubernetes/ssl/encryption-backup.yaml"
 )
 
 type encryptionKey struct {
@@ -282,6 +283,13 @@ func (c *Cluster) RotateEncryptionKey(ctx context.Context, fullState *FullState)
 		return err
 	}
 
+	// deploy the original encryption provider file as a backup
+	backupFileContents := c.EncryptionConfig.EncryptionProviderFile
+	logrus.Debugf("deploying backup encryption key with provider config: [oldKey]")
+	if err := c.DeployBackupEncryptionProviderFile(ctx, backupFileContents); err != nil {
+		return err
+	}
+
 	logrus.Debug("adding new encryption key, provider config: [newKey, oldKey]")
 
 	// Ensure encryption is done with newKey
@@ -345,6 +353,11 @@ func (c *Cluster) updateEncryptionProvider(ctx context.Context, keys []*encrypti
 func (c *Cluster) DeployEncryptionProviderFile(ctx context.Context) error {
 	logrus.Debugf("[%s] Deploying Encryption Provider Configuration file on Control Plane nodes..", services.ControlRole)
 	return deployFile(ctx, c.ControlPlaneHosts, c.SystemImages.Alpine, c.PrivateRegistriesMap, EncryptionProviderFilePath, c.EncryptionConfig.EncryptionProviderFile)
+}
+
+func (c *Cluster) DeployBackupEncryptionProviderFile(ctx context.Context, backupFileContents string) error {
+	logrus.Debugf("[%s] Deploying Backup Encryption Provider Configuration file on Control Plane nodes..", services.ControlRole)
+	return deployFile(ctx, c.ControlPlaneHosts, c.SystemImages.Alpine, c.PrivateRegistriesMap, EncryptionProviderBackupFilePath, backupFileContents)
 }
 
 // ReconcileDesiredStateEncryptionConfig We do the rotation outside of the cluster reconcile logic. When we are done,
